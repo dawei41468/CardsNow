@@ -42,7 +42,8 @@ class GameService {
         val newGameState = GameState(
             deck = deck,
             table = emptyList(),
-            discardPile = emptyList()
+            discardPile = emptyList(),
+            version = 1
         )
 
         // Set all player hands to empty
@@ -74,7 +75,8 @@ class GameService {
         room.players[playerName] = player.copy(hand = newHand)
         val updatedGameState = room.gameState.copy(
             table = currentTable,
-            lastPlayed = LastPlayed(playerName, cardsToPlay.map { it.id })
+            lastPlayed = LastPlayed(playerName, cardsToPlay.map { it.id }),
+            version = room.gameState.version + 1
         )
 
         room.updateLastActive()
@@ -93,7 +95,10 @@ class GameService {
         val newDiscardPile = room.gameState.discardPile + cardsToDiscard
 
         room.players[playerName] = player.copy(hand = newHand)
-        val updatedGameState = room.gameState.copy(discardPile = newDiscardPile)
+        val updatedGameState = room.gameState.copy(
+            discardPile = newDiscardPile,
+            version = room.gameState.version + 1
+        )
         room.updateLastActive()
 
         return Result.success(updatedGameState)
@@ -112,7 +117,10 @@ class GameService {
         val newHand = player.hand + drawnCard
 
         room.players[playerName] = player.copy(hand = newHand)
-        val updatedGameState = room.gameState.copy(deck = newDeck)
+        val updatedGameState = room.gameState.copy(
+            deck = newDeck,
+            version = room.gameState.version + 1
+        )
         room.updateLastActive()
 
         return Result.success(Pair(drawnCard, updatedGameState))
@@ -131,7 +139,10 @@ class GameService {
         val newHand = player.hand + drawnCard
 
         room.players[playerName] = player.copy(hand = newHand)
-        val updatedGameState = room.gameState.copy(discardPile = newDiscardPile)
+        val updatedGameState = room.gameState.copy(
+            discardPile = newDiscardPile,
+            version = room.gameState.version + 1
+        )
         room.updateLastActive()
 
         return Result.success(updatedGameState)
@@ -149,7 +160,8 @@ class GameService {
 
         val updatedGameState = room.gameState.copy(
             deck = newDeck,
-            table = emptyList()
+            table = emptyList(),
+            version = room.gameState.version + 1
         )
         room.updateLastActive()
 
@@ -184,7 +196,10 @@ class GameService {
             playerHands[player] = newHand
         }
 
-        val updatedGameState = room.gameState.copy(deck = newDeck)
+        val updatedGameState = room.gameState.copy(
+            deck = newDeck,
+            version = room.gameState.version + 1
+        )
         room.updateLastActive()
 
         return Result.success(Pair(playerHands, updatedGameState))
@@ -204,9 +219,10 @@ class GameService {
 
         room.players[fromPlayer] = fromPlayerObj.copy(hand = newFromHand)
         room.players[toPlayer] = toPlayerObj.copy(hand = newToHand)
+        val updatedGameState = room.gameState.copy(version = room.gameState.version + 1)
         room.updateLastActive()
 
-        return Result.success(room.gameState) // gameState unchanged
+        return Result.success(updatedGameState)
     }
     
     fun recallLastPile(room: Room, playerName: String): Result<GameState> {
@@ -238,7 +254,8 @@ class GameService {
         room.players[playerName] = player.copy(hand = newHand)
         val updatedGameState = room.gameState.copy(
             table = newTable,
-            lastPlayed = LastPlayed()
+            lastPlayed = LastPlayed(),
+            version = room.gameState.version + 1
         )
         room.updateLastActive()
 

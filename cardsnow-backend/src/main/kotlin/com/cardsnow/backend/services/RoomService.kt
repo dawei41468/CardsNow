@@ -2,9 +2,12 @@ package com.cardsnow.backend.services
 
 import com.cardsnow.backend.models.*
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class RoomService {
     private val rooms = ConcurrentHashMap<String, Room>()
+    private val roomLocks = ConcurrentHashMap<String, ReentrantLock>()
     
     fun createRoom(settings: RoomSettings, hostName: String): String {
         val code = generateRoomCode()
@@ -28,6 +31,19 @@ class RoomService {
 
     fun updateRoom(code: String, room: Room) {
         rooms[code] = room
+    }
+
+    fun <T> executeRoomOperation(roomCode: String, operation: () -> T): T {
+        val lock = roomLocks.computeIfAbsent(roomCode) { ReentrantLock() }
+        if (lock.tryLock(5000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            try {
+                return operation()
+            } finally {
+                lock.unlock()
+            }
+        } else {
+            throw IllegalStateException("Could not acquire lock for room $roomCode within 5 seconds")
+        }
     }
 
     fun removePlayerFromRoom(code: String, playerName: String) {

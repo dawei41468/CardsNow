@@ -83,6 +83,10 @@ sealed class WebSocketMessage {
     data class RoomCreated(val roomCode: String, val players: List<String>) : WebSocketMessage()
 
     @Serializable
+    @SerialName("session_created")
+    data class SessionCreated(val sessionId: String, val playerName: String, val roomCode: String) : WebSocketMessage()
+
+    @Serializable
     @SerialName("restart_game")
     data class RestartGame(val roomCode: String, val playerName: String) : WebSocketMessage()
 

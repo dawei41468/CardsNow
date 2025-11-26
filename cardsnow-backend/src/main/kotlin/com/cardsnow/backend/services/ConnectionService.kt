@@ -9,13 +9,25 @@ import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.isActive
 import com.cardsnow.backend.plugins.json
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.*
 
 class ConnectionService(
     private val roomService: RoomService,
     private val gameService: GameService
 ) {
     private val connections = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
-    private val playerConnections = ConcurrentHashMap<String, WebSocketSession>()
+    private val sessions = ConcurrentHashMap<String, Session>()
+    private val sessionToWebSocket = ConcurrentHashMap<String, WebSocketSession>()
+    
+    init {
+        // Start session cleanup job
+        CoroutineScope(Dispatchers.Default).launch {
+            while (true) {
+                delay(5 * 60 * 1000L) // Run every 5 minutes
+                cleanupExpiredSessions()
+            }
+        }
+    }
     
     suspend fun handleConnection(session: WebSocketSession) {
         try {
@@ -97,11 +109,25 @@ class ConnectionService(
     }
     
     private suspend fun handleCreateRoom(session: WebSocketSession, message: WebSocketMessage.CreateRoom) {
+        // Validate input
+        if (!ValidationService.validatePlayerName(message.hostName)) {
+            sendError(session, "Invalid player name. Must be 1-20 alphanumeric characters.", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomSettings(message.settings)) {
+            sendError(session, "Invalid room settings.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val roomCode = roomService.createRoom(message.settings, message.hostName)
+        
+        // Create session for the host
+        val sessionObj = Session.create(message.hostName, roomCode)
+        sessions[sessionObj.sessionId] = sessionObj
+        sessionToWebSocket[sessionObj.sessionId] = session
         
         // Add connection tracking
         connections.computeIfAbsent(roomCode) { mutableSetOf() }.add(session)
-        playerConnections["${roomCode}_${message.hostName}"] = session
         
         // Send room created message
         val roomCreatedMessage = WebSocketMessage.RoomCreated(
@@ -109,11 +135,29 @@ class ConnectionService(
             players = listOf(message.hostName)
         )
         session.send(json.encodeToString(WebSocketMessage.serializer(), roomCreatedMessage))
+        
+        // Also send session info
+        val sessionMessage = WebSocketMessage.SessionCreated(
+            sessionId = sessionObj.sessionId,
+            playerName = message.hostName,
+            roomCode = roomCode
+        )
+        session.send(json.encodeToString(WebSocketMessage.serializer(), sessionMessage))
 
-        println("Room created: $roomCode by ${message.hostName}")
+        println("Room created: $roomCode by ${message.hostName} with session ${sessionObj.sessionId}")
     }
     
     private suspend fun handleJoinRoom(session: WebSocketSession, message: WebSocketMessage.JoinRoom) {
+        // Validate input
+        if (!ValidationService.validatePlayerName(message.playerName)) {
+            sendError(session, "Invalid player name. Must be 1-20 alphanumeric characters.", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -124,9 +168,14 @@ class ConnectionService(
         val isRejoining = room.players.containsKey(message.playerName)
 
         if (isRejoining) {
-            // Player is rejoining, just restore session mapping
+            // Player is rejoining, restore session mapping
+            val existingSession = sessions.values.find { it.playerName == message.playerName && it.roomCode == message.roomCode }
+            if (existingSession != null) {
+                sessions[existingSession.sessionId] = existingSession.withUpdatedActivity()
+                sessionToWebSocket[existingSession.sessionId] = session
+            }
+            
             connections.computeIfAbsent(message.roomCode) { mutableSetOf() }.add(session)
-            playerConnections["${message.roomCode}_${message.playerName}"] = session
 
             // Send current game state to reconnected player
             val gameStateUpdate = WebSocketMessage.GameStateUpdate(
@@ -145,13 +194,25 @@ class ConnectionService(
             val success = roomService.joinRoom(message.roomCode, message.playerName)
 
             if (success) {
+                // Create session for new player
+                val sessionObj = Session.create(message.playerName, message.roomCode)
+                sessions[sessionObj.sessionId] = sessionObj
+                sessionToWebSocket[sessionObj.sessionId] = session
+                
                 // Add connection tracking
                 connections.computeIfAbsent(message.roomCode) { mutableSetOf() }.add(session)
-                playerConnections["${message.roomCode}_${message.playerName}"] = session
 
                 // Send success response
                 val successMessage = WebSocketMessage.Success("Joined room ${message.roomCode} as ${message.playerName}!")
                 session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+                
+                // Send session info
+                val sessionMessage = WebSocketMessage.SessionCreated(
+                    sessionId = sessionObj.sessionId,
+                    playerName = message.playerName,
+                    roomCode = message.roomCode
+                )
+                session.send(json.encodeToString(WebSocketMessage.serializer(), sessionMessage))
 
                 // Broadcast player joined to all room members
                 val updatedRoom = roomService.getRoom(message.roomCode)
@@ -172,6 +233,12 @@ class ConnectionService(
     }
     
     private suspend fun handleStartGame(session: WebSocketSession, message: WebSocketMessage.StartGame) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -180,38 +247,48 @@ class ConnectionService(
         }
 
         val player = room.players.values.find { it.isHost }
-        if (player?.name != getPlayerNameFromSession(session, message.roomCode)) {
+        if (player?.name != sessionObj.playerName) {
             sendError(session, "Only host can start game", ErrorType.TRANSIENT)
             return
         }
-
-        val result = gameService.startGame(room, room.players.keys.toList())
-
-        result.fold(
-            onSuccess = { gameState ->
-                val updatedRoom = room.copy(gameState = gameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-
-                // Broadcast game state update to all room members
-                val gameStateUpdate = WebSocketMessage.GameStateUpdate(
-                    roomCode = message.roomCode,
-                    gameState = gameState,
-                    players = updatedRoom.players
-                )
-                broadcastToRoom(message.roomCode, gameStateUpdate)
-
-                val successMessage = WebSocketMessage.Success("Game started!")
-                session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
-
-                println("Game started in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to start game", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val gameState = gameService.startGame(room, room.players.keys.toList()).getOrThrow()
+                    val updatedRoom = room.copy(gameState = gameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            val gameStateUpdate = WebSocketMessage.GameStateUpdate(
+                roomCode = message.roomCode,
+                gameState = updatedRoom.gameState,
+                players = updatedRoom.players
+            )
+            broadcastToRoom(message.roomCode, gameStateUpdate)
+
+            val successMessage = WebSocketMessage.Success("Game started!")
+            session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+            println("Game started in room ${message.roomCode}")
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to start game", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handlePlayCards(session: WebSocketSession, message: WebSocketMessage.PlayCards) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        
+        // Validate input
+        if (!ValidationService.validateCardIds(message.cardIds)) {
+            sendError(session, "Invalid card IDs", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -219,51 +296,68 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.playCards(room, playerName, message.cardIds)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                println("$playerName played ${message.cardIds.size} cards in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to play cards", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.playCards(room, sessionObj.playerName, message.cardIds).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            // If we get here, operation was successful
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            println("${sessionObj.playerName} played ${message.cardIds.size} cards in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to play cards", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleDiscardCards(session: WebSocketSession, message: WebSocketMessage.DiscardCards) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        
+        // Validate input
+        if (!ValidationService.validateCardIds(message.cardIds)) {
+            sendError(session, "Invalid card IDs", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
             sendError(session, "Room not found", ErrorType.CRITICAL)
             return
         }
-
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.discardCards(room, playerName, message.cardIds)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                println("$playerName discarded ${message.cardIds.size} cards in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to discard cards", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.discardCards(room, sessionObj.playerName, message.cardIds).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            println("${sessionObj.playerName} discarded ${message.cardIds.size} cards in room ${message.roomCode}")
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to discard cards", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleDrawCard(session: WebSocketSession, message: WebSocketMessage.DrawCard) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -271,25 +365,31 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.drawCard(room, playerName)
-
-        result.fold(
-            onSuccess = { (card, updatedGameState) ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                println("$playerName drew a card in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to draw card", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val (_, updatedGameState) = gameService.drawCard(room, sessionObj.playerName).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            println("${sessionObj.playerName} drew a card in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to draw card", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleDrawFromDiscard(session: WebSocketSession, message: WebSocketMessage.DrawFromDiscard) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -297,25 +397,31 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.drawFromDiscard(room, playerName)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                println("$playerName drew from discard in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to draw from discard", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.drawFromDiscard(room, sessionObj.playerName).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            println("${sessionObj.playerName} drew from discard in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to draw from discard", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleShuffleDeck(session: WebSocketSession, message: WebSocketMessage.ShuffleDeck) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -323,28 +429,40 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.shuffleDeck(room, playerName)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                val successMessage = WebSocketMessage.Success("Deck shuffled!")
-                session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
-
-                println("$playerName shuffled deck in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to shuffle deck", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.shuffleDeck(room, sessionObj.playerName).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            
+            val successMessage = WebSocketMessage.Success("Deck shuffled!")
+            session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+            println("${sessionObj.playerName} shuffled deck in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to shuffle deck", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleDealCards(session: WebSocketSession, message: WebSocketMessage.DealCards) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        
+        // Validate input
+        if (!ValidationService.validateCardCount(message.count)) {
+            sendError(session, "Invalid card count. Must be between 1 and 13.", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -352,28 +470,44 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.dealCards(room, playerName, message.count)
-
-        result.fold(
-            onSuccess = { (playerHands, updatedGameState) ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                val successMessage = WebSocketMessage.Success("Dealt ${message.count} cards to each player!")
-                session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
-
-                println("$playerName dealt ${message.count} cards in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to deal cards", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val (_, updatedGameState) = gameService.dealCards(room, sessionObj.playerName, message.count).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            
+            val successMessage = WebSocketMessage.Success("Dealt ${message.count} cards to each player!")
+            session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+            println("${sessionObj.playerName} dealt ${message.count} cards in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to deal cards", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleMoveCards(session: WebSocketSession, message: WebSocketMessage.MoveCards) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        
+        // Validate input
+        if (!ValidationService.validatePlayerName(message.toPlayer)) {
+            sendError(session, "Invalid target player name", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateCardIds(message.cardIds)) {
+            sendError(session, "Invalid card IDs", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -381,25 +515,31 @@ class ConnectionService(
             return
         }
 
-        val fromPlayer = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.moveCards(room, fromPlayer, message.toPlayer, message.cardIds)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                println("$fromPlayer moved cards to ${message.toPlayer} in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to move cards", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.moveCards(room, sessionObj.playerName, message.toPlayer, message.cardIds).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            println("${sessionObj.playerName} moved cards to ${message.toPlayer} in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to move cards", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleRecallLastPile(session: WebSocketSession, message: WebSocketMessage.RecallLastPile) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -407,28 +547,34 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val result = gameService.recallLastPile(room, playerName)
-
-        result.fold(
-            onSuccess = { updatedGameState ->
-                val updatedRoom = room.copy(gameState = updatedGameState)
-                roomService.updateRoom(message.roomCode, updatedRoom)
-                broadcastGameStateUpdate(message.roomCode, updatedRoom)
-
-                val successMessage = WebSocketMessage.Success("Last pile recalled!")
-                session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
-
-                println("$playerName recalled last pile in room ${message.roomCode}")
-            },
-            onFailure = { error ->
-                sendError(session, error.message ?: "Failed to recall pile", ErrorType.TRANSIENT)
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.recallLastPile(room, sessionObj.playerName).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
             }
-        )
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            
+            val successMessage = WebSocketMessage.Success("Last pile recalled!")
+            session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+            println("${sessionObj.playerName} recalled last pile in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to recall pile", ErrorType.TRANSIENT)
+        }
     }
     
     private suspend fun handleSortHand(session: WebSocketSession, message: WebSocketMessage.SortHand) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -436,24 +582,37 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val player = room.players[playerName]
+        val player = room.players[sessionObj.playerName]
         if (player == null) {
             sendError(session, "Player not found", ErrorType.CRITICAL)
             return
         }
 
         val sortedHand = gameService.sortHand(player.hand, message.sortBy)
-        room.players[playerName] = player.copy(hand = sortedHand)
+        val updatedRoom = room.copy(players = room.players.toMutableMap().apply {
+            this[sessionObj.playerName] = player.copy(hand = sortedHand)
+        })
+        roomService.updateRoom(message.roomCode, updatedRoom)
 
-        broadcastGameStateUpdate(message.roomCode, room)
+        broadcastGameStateUpdate(message.roomCode, updatedRoom)
 
         val sortType = if (message.sortBy == SortType.RANK) "rank" else "suit"
-        println("$playerName sorted hand by $sortType in room ${message.roomCode}")
+        println("${sessionObj.playerName} sorted hand by $sortType in room ${message.roomCode}")
     }
     
     private suspend fun handleReorderHand(session: WebSocketSession, message: WebSocketMessage.ReorderHand) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        
+        // Validate input
+        if (!ValidationService.validateCardIds(message.cardIds)) {
+            sendError(session, "Invalid card IDs", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -461,9 +620,7 @@ class ConnectionService(
             return
         }
 
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
-
-        val player = room.players[playerName]
+        val player = room.players[sessionObj.playerName]
         if (player == null) {
             sendError(session, "Player not found", ErrorType.CRITICAL)
             return
@@ -478,21 +635,28 @@ class ConnectionService(
             return
         }
 
-        room.players[playerName] = player.copy(hand = reorderedHand)
-        broadcastGameStateUpdate(message.roomCode, room)
+        val updatedRoom = room.copy(players = room.players.toMutableMap().apply {
+            this[sessionObj.playerName] = player.copy(hand = reorderedHand)
+        })
+        roomService.updateRoom(message.roomCode, updatedRoom)
+        broadcastGameStateUpdate(message.roomCode, updatedRoom)
 
-        println("$playerName reordered hand in room ${message.roomCode}")
+        println("${sessionObj.playerName} reordered hand in room ${message.roomCode}")
     }
 
     private suspend fun handleRestartGame(session: WebSocketSession, message: WebSocketMessage.RestartGame) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
             sendError(session, "Room not found", ErrorType.CRITICAL)
             return
         }
-
-        val playerName = getPlayerNameFromSession(session, message.roomCode) ?: return sendError(session, "Player not authenticated", ErrorType.CRITICAL)
 
         // Reset game state - create new room with updated state
         val resetGameState = GameState(
@@ -520,10 +684,20 @@ class ConnectionService(
         val successMessage = WebSocketMessage.Success("Game restarted!")
         session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
 
-        println("$playerName restarted game in room ${message.roomCode}")
+        println("${sessionObj.playerName} restarted game in room ${message.roomCode}")
     }
 
     private suspend fun handleReconnect(session: WebSocketSession, message: WebSocketMessage.Reconnect) {
+        // Validate input
+        if (!ValidationService.validatePlayerName(message.playerName)) {
+            sendError(session, "Invalid player name", ErrorType.TRANSIENT)
+            return
+        }
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code", ErrorType.TRANSIENT)
+            return
+        }
+        
         val room = roomService.getRoom(message.roomCode)
 
         if (room == null) {
@@ -538,8 +712,13 @@ class ConnectionService(
         }
 
         // Restore session mapping
+        val existingSession = sessions.values.find { it.playerName == message.playerName && it.roomCode == message.roomCode }
+        if (existingSession != null) {
+            sessions[existingSession.sessionId] = existingSession.withUpdatedActivity()
+            sessionToWebSocket[existingSession.sessionId] = session
+        }
+        
         connections.computeIfAbsent(message.roomCode) { mutableSetOf() }.add(session)
-        playerConnections["${message.roomCode}_${message.playerName}"] = session
 
         // Send current game state to reconnected player
         val gameStateUpdate = WebSocketMessage.GameStateUpdate(
@@ -585,28 +764,39 @@ class ConnectionService(
         session.send(json.encodeToString(WebSocketMessage.serializer(), errorMessage))
     }
     
-    private fun getPlayerNameFromSession(session: WebSocketSession, roomCode: String): String? {
-        return playerConnections.entries.find { (key, value) ->
-            key.startsWith("${roomCode}_") && value == session
-        }?.key?.removePrefix("${roomCode}_")
+    private fun getSessionFromWebSocket(session: WebSocketSession): Session? {
+        return sessionToWebSocket.entries.find { it.value == session }?.key?.let { sessions[it] }
     }
     
     private fun cleanupDisconnectedPlayer(session: WebSocketSession) {
-        // Find which player this session belongs to
-        val entry = playerConnections.entries.find { it.value == session }
-        if (entry != null) {
-            val (key, _) = entry
-            val parts = key.split("_")
-            if (parts.size == 2) {
-                val roomCode = parts[0]
-                val playerName = parts[1]
+        // Find which session this WebSocket belongs to
+        val sessionId = sessionToWebSocket.entries.find { it.value == session }?.key
+        if (sessionId != null) {
+            val sessionObj = sessions[sessionId]
+            if (sessionObj != null) {
+                // Remove from connection tracking only - keep session for potential reconnection
+                connections[sessionObj.roomCode]?.remove(session)
+                sessionToWebSocket.remove(sessionId)
 
-                // Remove from connection tracking only - keep player in room for potential reconnection
-                playerConnections.remove(key)
-                connections[roomCode]?.remove(session)
-
-                println("Player $playerName disconnected from room $roomCode (session cleaned up, player remains in room)")
+                println("Player ${sessionObj.playerName} disconnected from room ${sessionObj.roomCode} (session cleaned up, session remains active)")
             }
+        }
+    }
+    
+    private fun cleanupExpiredSessions() {
+        val now = System.currentTimeMillis()
+        val expiredSessions = sessions.filter { (_, session) ->
+            session.isExpired()
+        }
+        
+        expiredSessions.forEach { (sessionId, session) ->
+            val ws = sessionToWebSocket[sessionId]
+            sessions.remove(sessionId)
+            sessionToWebSocket.remove(sessionId)
+            if (ws != null) {
+                connections[session.roomCode]?.remove(ws)
+            }
+            println("Cleaned up expired session for player ${session.playerName} in room ${session.roomCode}")
         }
     }
 }
