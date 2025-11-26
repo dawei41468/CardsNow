@@ -44,6 +44,10 @@ data class GameState(
     val deckEmpty: Boolean = false,
     val deckSize: Int = 0,
     val otherPlayersHandSizes: Map<String, Int> = emptyMap(),
+    val lastPlayedPlayer: String = "",
+    val lastPlayedCardIds: List<String> = emptyList(),
+    val lastDiscardedPlayer: String = "",
+    val lastDiscardedCardIds: List<String> = emptyList(),
     val canRecall: Boolean = false,
     val showMenu: Boolean = false,
     val isLoadingGeneral: Boolean = false,
@@ -167,6 +171,7 @@ class KtorViewModel : ViewModel() {
                     val errorMessage = jsonObject["message"]?.jsonPrimitive?.content ?: ""
                     val errorTypeStr = jsonObject["errorType"]?.jsonPrimitive?.content ?: "TRANSIENT"
                     val errorType = ErrorType.valueOf(errorTypeStr)
+                    _gameState.value = _gameState.value.copy(isLoadingGeneral = false)
                     showError(errorMessage, errorType)
                 }
                 "game_state_update" -> {
@@ -203,6 +208,16 @@ class KtorViewModel : ViewModel() {
             _gameState.value = _gameState.value.copy(
                 roomCode = roomCode,
                 players = listOf(_gameState.value.playerName), // Add host to players list
+                screen = "room",
+                successMessage = message,
+                errorMessage = "",
+                errorType = ErrorType.NONE,
+                isLoadingGeneral = false
+            )
+        } else if (message.contains(" room ") && message.endsWith("!")) {
+            // For join or rejoin success
+            _gameState.value = _gameState.value.copy(
+                screen = "room",
                 successMessage = message,
                 errorMessage = "",
                 errorType = ErrorType.NONE,
@@ -234,6 +249,12 @@ class KtorViewModel : ViewModel() {
             val deckSize = gameStateJson?.get("deck")?.jsonArray?.size ?: 0
             val table = parseTable(gameStateJson?.get("table")?.jsonArray)
             val discardPile = parseCards(gameStateJson?.get("discardPile")?.jsonArray)
+            val lastPlayedJson = gameStateJson?.get("lastPlayed")?.jsonObject
+            val lastPlayedPlayer = lastPlayedJson?.get("player")?.jsonPrimitive?.content ?: ""
+            val lastPlayedCardIds = lastPlayedJson?.get("cardIds")?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            val lastDiscardedJson = gameStateJson?.get("lastDiscarded")?.jsonObject
+            val lastDiscardedPlayer = lastDiscardedJson?.get("player")?.jsonPrimitive?.content ?: ""
+            val lastDiscardedCardIds = lastDiscardedJson?.get("cardIds")?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
             
             // Parse players
             val playersJson = jsonObject["players"]?.jsonObject
@@ -258,6 +279,15 @@ class KtorViewModel : ViewModel() {
                     }
                 }
             }
+            val lastPileCardIds = if (table.isNotEmpty()) table.last().map { it.id } else emptyList()
+            val pileEligible = lastPlayedPlayer == _gameState.value.playerName &&
+                    lastPileCardIds.isNotEmpty() &&
+                    lastPileCardIds == lastPlayedCardIds
+            val discardEligible = lastDiscardedPlayer == _gameState.value.playerName &&
+                    lastDiscardedCardIds.isNotEmpty() &&
+                    discardPile.size >= lastDiscardedCardIds.size &&
+                    discardPile.takeLast(lastDiscardedCardIds.size).map { it.id } == lastDiscardedCardIds
+            val canRecall = pileEligible || discardEligible
             
             _gameState.value = _gameState.value.copy(
                 roomCode = roomCode,
@@ -270,6 +300,11 @@ class KtorViewModel : ViewModel() {
                 deckSize = deckSize,
                 deckEmpty = deckSize == 0,
                 otherPlayersHandSizes = otherPlayersHandSizes,
+                lastPlayedPlayer = lastPlayedPlayer,
+                lastPlayedCardIds = lastPlayedCardIds,
+                lastDiscardedPlayer = lastDiscardedPlayer,
+                lastDiscardedCardIds = lastDiscardedCardIds,
+                canRecall = canRecall,
                 isLoadingGeneral = false
             )
         } catch (e: Exception) {
@@ -349,7 +384,6 @@ class KtorViewModel : ViewModel() {
             sendMessage(message)
             
             _gameState.value = _gameState.value.copy(
-                screen = "room",
                 playerName = _gameState.value.hostName.trim(),
                 isHost = true
             )
@@ -379,7 +413,6 @@ class KtorViewModel : ViewModel() {
             sendMessage(message)
             
             _gameState.value = _gameState.value.copy(
-                screen = "room",
                 roomCode = trimmedCode,
                 playerName = trimmedName
             )
@@ -554,11 +587,29 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val message = WebSocketMessage.RecallLastPile(
-                roomCode = _gameState.value.roomCode,
-                playerName = _gameState.value.playerName
-            )
-            sendMessage(message)
+            val pileEligible = _gameState.value.lastPlayedPlayer == _gameState.value.playerName &&
+                    _gameState.value.table.isNotEmpty() &&
+                    _gameState.value.table.last().map { it.id } == _gameState.value.lastPlayedCardIds
+            val discardEligible = _gameState.value.lastDiscardedPlayer == _gameState.value.playerName &&
+                    _gameState.value.lastDiscardedCardIds.isNotEmpty() &&
+                    _gameState.value.discardPile.size >= _gameState.value.lastDiscardedCardIds.size &&
+                    _gameState.value.discardPile.takeLast(_gameState.value.lastDiscardedCardIds.size).map { it.id } == _gameState.value.lastDiscardedCardIds
+
+            if (discardEligible) {
+                val message = WebSocketMessage.RecallLastDiscard(
+                    roomCode = _gameState.value.roomCode,
+                    playerName = _gameState.value.playerName
+                )
+                sendMessage(message)
+            } else if (pileEligible) {
+                val message = WebSocketMessage.RecallLastPile(
+                    roomCode = _gameState.value.roomCode,
+                    playerName = _gameState.value.playerName
+                )
+                sendMessage(message)
+            } else {
+                showError("Nothing to recall", ErrorType.TRANSIENT)
+            }
             
             _gameState.value = _gameState.value.copy(isLoadingGeneral = false)
         }

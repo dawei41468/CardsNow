@@ -76,6 +76,7 @@ class GameService {
         val updatedGameState = room.gameState.copy(
             table = currentTable,
             lastPlayed = LastPlayed(playerName, cardsToPlay.map { it.id }),
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
 
@@ -97,6 +98,47 @@ class GameService {
         room.players[playerName] = player.copy(hand = newHand)
         val updatedGameState = room.gameState.copy(
             discardPile = newDiscardPile,
+            lastDiscarded = LastPlayed(playerName, cardsToDiscard.map { it.id }),
+            lastPlayed = LastPlayed(),
+            version = room.gameState.version + 1
+        )
+        room.updateLastActive()
+
+        return Result.success(updatedGameState)
+    }
+    
+    fun recallLastDiscard(room: Room, playerName: String): Result<GameState> {
+        val player = room.players[playerName] ?: return Result.failure(Exception("Player not found"))
+        val lastDiscarded = room.gameState.lastDiscarded
+
+        if (lastDiscarded.player != playerName) {
+            return Result.failure(Exception("Not your last discard"))
+        }
+
+        val lastDiscardIds = lastDiscarded.cardIds
+        val discardPile = room.gameState.discardPile
+
+        if (discardPile.isEmpty() || lastDiscardIds.isEmpty()) {
+            return Result.failure(Exception("No valid discard to recall"))
+        }
+
+        if (discardPile.size < lastDiscardIds.size) {
+            return Result.failure(Exception("No valid discard to recall"))
+        }
+
+        val tail = discardPile.takeLast(lastDiscardIds.size)
+        val tailIds = tail.map { it.id }
+        if (tailIds != lastDiscardIds) {
+            return Result.failure(Exception("No valid discard to recall"))
+        }
+
+        val newDiscardPile = discardPile.dropLast(lastDiscardIds.size)
+        val newHand = player.hand + tail
+
+        room.players[playerName] = player.copy(hand = newHand)
+        val updatedGameState = room.gameState.copy(
+            discardPile = newDiscardPile,
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()
@@ -119,6 +161,7 @@ class GameService {
         room.players[playerName] = player.copy(hand = newHand)
         val updatedGameState = room.gameState.copy(
             deck = newDeck,
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()
@@ -141,6 +184,7 @@ class GameService {
         room.players[playerName] = player.copy(hand = newHand)
         val updatedGameState = room.gameState.copy(
             discardPile = newDiscardPile,
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()
@@ -161,6 +205,7 @@ class GameService {
         val updatedGameState = room.gameState.copy(
             deck = newDeck,
             table = emptyList(),
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()
@@ -198,6 +243,7 @@ class GameService {
 
         val updatedGameState = room.gameState.copy(
             deck = newDeck,
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()
@@ -219,7 +265,10 @@ class GameService {
 
         room.players[fromPlayer] = fromPlayerObj.copy(hand = newFromHand)
         room.players[toPlayer] = toPlayerObj.copy(hand = newToHand)
-        val updatedGameState = room.gameState.copy(version = room.gameState.version + 1)
+        val updatedGameState = room.gameState.copy(
+            lastDiscarded = LastPlayed(),
+            version = room.gameState.version + 1
+        )
         room.updateLastActive()
 
         return Result.success(updatedGameState)
@@ -255,6 +304,7 @@ class GameService {
         val updatedGameState = room.gameState.copy(
             table = newTable,
             lastPlayed = LastPlayed(),
+            lastDiscarded = LastPlayed(),
             version = room.gameState.version + 1
         )
         room.updateLastActive()

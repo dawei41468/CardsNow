@@ -85,6 +85,9 @@ class ConnectionService(
                 is WebSocketMessage.RecallLastPile -> {
                     handleRecallLastPile(session, webSocketMessage)
                 }
+                is WebSocketMessage.RecallLastDiscard -> {
+                    handleRecallLastDiscard(session, webSocketMessage)
+                }
                 is WebSocketMessage.SortHand -> {
                     handleSortHand(session, webSocketMessage)
                 }
@@ -144,6 +147,10 @@ class ConnectionService(
         )
         session.send(json.encodeToString(WebSocketMessage.serializer(), sessionMessage))
 
+        // Send success message to trigger frontend navigation
+        val successMessage = WebSocketMessage.Success("Room $roomCode created!")
+        session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+
         println("Room created: $roomCode by ${message.hostName} with session ${sessionObj.sessionId}")
     }
     
@@ -168,8 +175,14 @@ class ConnectionService(
         val isRejoining = room.players.containsKey(message.playerName)
 
         if (isRejoining) {
-            // Player is rejoining, restore session mapping
+            // Check if player is still connected
             val existingSession = sessions.values.find { it.playerName == message.playerName && it.roomCode == message.roomCode }
+            if (existingSession != null && sessionToWebSocket.containsKey(existingSession.sessionId)) {
+                sendError(session, "Player name already taken.", ErrorType.TRANSIENT)
+                return
+            }
+            
+            // Player is rejoining, restore session mapping
             if (existingSession != null) {
                 sessions[existingSession.sessionId] = existingSession.withUpdatedActivity()
                 sessionToWebSocket[existingSession.sessionId] = session
@@ -191,6 +204,11 @@ class ConnectionService(
             println("Player ${message.playerName} rejoined room ${message.roomCode}")
         } else {
             // New player joining
+            if (room.players.containsKey(message.playerName)) {
+                sendError(session, "Player name already taken.", ErrorType.TRANSIENT)
+                return
+            }
+            
             val success = roomService.joinRoom(message.roomCode, message.playerName)
 
             if (success) {
@@ -454,10 +472,6 @@ class ConnectionService(
         val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
         
         // Validate input
-        if (!ValidationService.validateCardCount(message.count)) {
-            sendError(session, "Invalid card count. Must be between 1 and 13.", ErrorType.TRANSIENT)
-            return
-        }
         if (!ValidationService.validateRoomCode(message.roomCode)) {
             sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
             return
@@ -467,6 +481,13 @@ class ConnectionService(
 
         if (room == null) {
             sendError(session, "Room not found", ErrorType.CRITICAL)
+            return
+        }
+
+        // Validate card count based on deck size and player count
+        val playerCount = room.players.size
+        if (message.count <= 0 || message.count * playerCount > room.gameState.deck.size) {
+            sendError(session, "Invalid card count. Must be between 1 and ${room.gameState.deck.size / playerCount}.", ErrorType.TRANSIENT)
             return
         }
 
@@ -565,6 +586,41 @@ class ConnectionService(
             
         } catch (e: Exception) {
             sendError(session, e.message ?: "Failed to recall pile", ErrorType.TRANSIENT)
+        }
+    }
+    
+    private suspend fun handleRecallLastDiscard(session: WebSocketSession, message: WebSocketMessage.RecallLastDiscard) {
+        val sessionObj = getSessionFromWebSocket(session) ?: return sendError(session, "Session not found", ErrorType.CRITICAL)
+        if (!ValidationService.validateRoomCode(message.roomCode)) {
+            sendError(session, "Invalid room code. Must be 4 digits.", ErrorType.TRANSIENT)
+            return
+        }
+        
+        val room = roomService.getRoom(message.roomCode)
+
+        if (room == null) {
+            sendError(session, "Room not found", ErrorType.CRITICAL)
+            return
+        }
+
+        try {
+            roomService.executeRoomOperation(message.roomCode) {
+                room.atomicUpdate {
+                    val updatedGameState = gameService.recallLastDiscard(room, sessionObj.playerName).getOrThrow()
+                    val updatedRoom = room.copy(gameState = updatedGameState)
+                    roomService.updateRoom(message.roomCode, updatedRoom)
+                }
+            }
+            
+            val updatedRoom = roomService.getRoom(message.roomCode)!!
+            broadcastGameStateUpdate(message.roomCode, updatedRoom)
+            
+            val successMessage = WebSocketMessage.Success("Last discard recalled!")
+            session.send(json.encodeToString(WebSocketMessage.serializer(), successMessage))
+            println("${sessionObj.playerName} recalled last discard in room ${message.roomCode}")
+            
+        } catch (e: Exception) {
+            sendError(session, e.message ?: "Failed to recall discard", ErrorType.TRANSIENT)
         }
     }
     

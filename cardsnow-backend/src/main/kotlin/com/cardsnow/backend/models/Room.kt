@@ -64,6 +64,7 @@ data class GameState(
     val table: List<List<Card>> = emptyList(),
     val discardPile: List<Card> = emptyList(),
     val lastPlayed: LastPlayed = LastPlayed(),
+    val lastDiscarded: LastPlayed = LastPlayed(),
     val version: Long = 0
 )
 

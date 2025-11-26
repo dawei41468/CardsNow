@@ -50,6 +50,10 @@ sealed class WebSocketMessage {
     data class RecallLastPile(val roomCode: String, val playerName: String) : WebSocketMessage()
 
     @Serializable
+    @SerialName("recall_last_discard")
+    data class RecallLastDiscard(val roomCode: String, val playerName: String) : WebSocketMessage()
+
+    @Serializable
     @SerialName("reorder_hand")
     data class ReorderHand(val roomCode: String, val playerName: String, val cardIds: List<String>) : WebSocketMessage()
 
