@@ -1,6 +1,8 @@
 package com.cardsnow.backend.services
 
 import com.cardsnow.backend.models.*
+import com.cardsnow.backend.config.ServerConfig
+import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -8,13 +10,14 @@ import kotlin.concurrent.withLock
 class RoomService {
     private val rooms = ConcurrentHashMap<String, Room>()
     private val roomLocks = ConcurrentHashMap<String, ReentrantLock>()
+    private val logger = LoggerFactory.getLogger(RoomService::class.java)
     
     fun createRoom(settings: RoomSettings, hostName: String): String {
         val code = generateRoomCode()
         val room = Room(code, settings, hostName)
         room.addPlayer(hostName)
         rooms[code] = room
-        println("Room created: $code by $hostName with ${settings.numDecks} decks")
+        logger.info("Room created: {} by {} with {} decks", code, hostName, settings.numDecks)
         return code
     }
     
@@ -22,7 +25,7 @@ class RoomService {
         val room = rooms[code] ?: return false
         val success = room.addPlayer(playerName)
         if (success) {
-            println("Player $playerName joined room $code")
+            logger.info("Player {} joined room {}", playerName, code)
         }
         return success
     }
@@ -35,30 +38,31 @@ class RoomService {
 
     fun <T> executeRoomOperation(roomCode: String, operation: () -> T): T {
         val lock = roomLocks.computeIfAbsent(roomCode) { ReentrantLock() }
-        if (lock.tryLock(5000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+        if (lock.tryLock(ServerConfig.LOCK_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
             try {
                 return operation()
             } finally {
                 lock.unlock()
             }
         } else {
-            throw IllegalStateException("Could not acquire lock for room $roomCode within 5 seconds")
+            val seconds = ServerConfig.LOCK_TIMEOUT_MS / 1000
+            throw IllegalStateException("Could not acquire lock for room $roomCode within ${seconds} seconds")
         }
     }
 
     fun removePlayerFromRoom(code: String, playerName: String) {
         val room = rooms[code] ?: return
         room.removePlayer(playerName)
-        println("Player $playerName removed from room $code")
+        logger.info("Player {} removed from room {}", playerName, code)
         
         // Remove room if empty
         if (room.players.isEmpty()) {
             rooms.remove(code)
-            println("Room $code deleted (empty)")
+            logger.info("Room {} deleted (empty)", code)
         }
     }
     
-    fun cleanupOldRooms(maxAgeMinutes: Int = 30) {
+    fun cleanupOldRooms(maxAgeMinutes: Int = ServerConfig.OLD_ROOM_MAX_AGE_MINUTES) {
         val now = System.currentTimeMillis()
         val threshold = now - (maxAgeMinutes * 60 * 1000)
         
@@ -68,7 +72,7 @@ class RoomService {
         
         roomsToRemove.forEach { code ->
             rooms.remove(code)
-            println("Deleted stale room: $code")
+            logger.info("Deleted stale room: {}", code)
         }
     }
     
@@ -77,7 +81,7 @@ class RoomService {
     private fun generateRoomCode(): String {
         var code: String
         do {
-            code = (1000..9999).random().toString()
+            code = (ServerConfig.ROOM_CODE_MIN..ServerConfig.ROOM_CODE_MAX).random().toString()
         } while (rooms.containsKey(code))
         return code
     }

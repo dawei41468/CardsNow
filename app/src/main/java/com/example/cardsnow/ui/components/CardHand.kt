@@ -31,6 +31,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.example.cardsnow.Card
+import android.util.Log
+import com.example.cardsnow.ClientConfig
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -130,7 +132,7 @@ fun CardHand(
                                 draggedCardIndex = index
                                 dragOffsetX = 0f
                                 targetDropIndex = index
-                                println("Started dragging card at index $index: ${card.rank} of ${card.suit}")
+                                if (ClientConfig.IS_DEBUG) Log.d("CardHand", "Started dragging card at index $index: ${card.rank} of ${card.suit}")
                             },
                             onDrag = { change, dragAmount ->
                                 change.consume()
@@ -173,7 +175,7 @@ fun CardHand(
                                     cardListState.addAll(newList)
                                     onCardsReordered(newList)
 
-                                    println("Reordered: ${newList.map { it.rank + " of " + it.suit }}")
+                                    if (ClientConfig.IS_DEBUG) Log.d("CardHand", "Reordered: ${newList.map { it.rank + " of " + it.suit }}")
                                 }
 
                                 // Reset drag state
@@ -181,7 +183,7 @@ fun CardHand(
                                 dragOffsetX = 0f
                                 targetDropIndex = -1
                                 dragStarted.value = false
-                                println("Drag ended")
+                                if (ClientConfig.IS_DEBUG) Log.d("CardHand", "Drag ended")
                             },
                             onDragCancel = {
                                 // Reset drag state on cancel
@@ -189,7 +191,7 @@ fun CardHand(
                                 dragOffsetX = 0f
                                 targetDropIndex = -1
                                 dragStarted.value = false
-                                println("Drag cancelled for card at index $index")
+                                if (ClientConfig.IS_DEBUG) Log.d("CardHand", "Drag cancelled for card at index $index")
                             }
                         )
                     }

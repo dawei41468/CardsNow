@@ -7,12 +7,13 @@ import io.ktor.server.websocket.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.isActive
 import java.time.Duration
+import com.cardsnow.backend.config.ServerConfig
 
 fun Application.configureWebSockets(connectionService: ConnectionService) {
     install(WebSockets) {
         pingPeriod = Duration.ofSeconds(15)
         timeout = Duration.ofSeconds(15)
-        maxFrameSize = Long.MAX_VALUE
+        maxFrameSize = ServerConfig.WS_MAX_FRAME_BYTES
         masking = false
     }
     

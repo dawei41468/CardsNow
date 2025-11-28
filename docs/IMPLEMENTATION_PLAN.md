@@ -1,218 +1,115 @@
 # CardsNow App: Comprehensive Implementation Plan
 
 ## Overview
-This document outlines the complete implementation plan to address all critical vulnerabilities identified in `POTENTIAL_ERRORS_ANALYSIS.md`. The plan is structured in phases based on risk priority, with each phase containing specific, actionable tasks.
+This plan focuses on what remains after the mitigations already implemented and validated in code/tests. It aligns with the updated risks in `POTENTIAL_ERRORS_ANALYSIS.md`.
 
-## Phase Priority Ranking
-Based on the analysis, risks are ranked as:
-- **Critical**: Likely to cause immediate failures
-- **High**: Will cause issues under load or edge cases
-- **Medium**: Degrade experience but not crash
-- **Low**: Technical debt, scalability limits
-
----
-
-## Phase 1: Critical Fixes (Immediate Deployment Required)
-**Focus:** Prevent immediate failures and data corruption
-
-### ✅ **Completed Tasks:**
-
-#### 1. Implement Atomic Room Operations
-- ✅ Added `version: Long = 0` field to `GameState` data class
-- ✅ Added `@Transient` `ReentrantLock` to `Room` class with `atomicUpdate()` method
-- ✅ Modified all `GameService` methods to increment version on state changes
-- ✅ Added proper serialization handling for the lock
-
-#### 2. Version Tracking Infrastructure
-- ✅ All game operations now increment `GameState.version`
-- ✅ Start game initializes version to 1
-- ✅ Each state change increments version atomically
-
-#### 3. Thread-Safe Infrastructure
-- ✅ Room-level locking mechanism in place
-- ✅ Per-room operation queuing capability added to `RoomService`
-- ✅ Foundation for race condition prevention established
-
-### ✅ **Completed Tasks:**
-
-#### 4. Fix Race Conditions in Simultaneous Actions
-**Objective:** Ensure only one game operation per room executes at a time
-- ✅ Update all game operation handlers to use `roomService.executeRoomOperation()` and `room.atomicUpdate()`
-- ✅ Apply atomic pattern to: `handlePlayCards`, `handleDealCards`, `handleDrawCard`, `handleDrawFromDiscard`, `handleShuffleDeck`, `handleMoveCards`, `handleRecallLastPile`
-- ✅ Add 5-second timeout for lock acquisition with proper error handling
-
-#### 5. Strengthen Session Management
-**Objective:** Prevent session hijacking and improve reconnection reliability
-- ✅ Create `Session` data class with secure session IDs
-- ✅ Replace `playerConnections` mapping with `Session` objects
-- ✅ Update all connection handling logic
-- ✅ Implement session expiration (24-hour TTL) with cleanup job
-
-#### 6. Add Comprehensive Input Validation
-**Objective:** Prevent invalid operations that could corrupt game state
-- ✅ Create `ValidationService` with methods for card validation, player names, room codes
-- ✅ Add validation calls at the start of each `ConnectionService` handler
-- ✅ Return specific error messages for validation failures
-- ✅ Add bounds checking for all numeric inputs
+## Baseline implemented (verified)
+- Room-level locking and operation queueing with timeout (`Room.atomicUpdate`, `RoomService.executeRoomOperation`).
+- State versioning and client guard against older updates.
+- Operation timeouts with `TIMEOUT` error and tests.
+- Message rate limiting per session and `create_room` IP throttling.
+- Payload and frame size limits with explicit errors and tests.
+- Send retry + dead-letter queue on repeated failures.
+- Validation for names, room codes, card IDs, room settings.
+- Secure sessions with TTL, cleanup job, and reconnection flow.
+- Android client: jittered exponential reconnect, Ping, bounded outgoing buffer, ack-gated flush.
 
 ---
 
-## Phase 2: High Priority Fixes (Deploy After Phase 1)
-**Focus:** Prevent DoS attacks and memory issues
+## Phase 1: Critical (ship next)
+Focus: Correctness and abuse resistance.
 
-### 📋 **Planned Tasks:**
+- Presence and host-migration on disconnect
+  - Backend: On WebSocket disconnect, remove player from room, reassign host if needed, and broadcast `player_left(roomCode, playerName, newHost)`.
+  - Client: Update roster and host flag immediately on event.
+  - Acceptance: Disconnect a player → others receive `player_left`; if host leaves, `newHost` set and UI reflects change.
 
-#### 7. Implement Rate Limiting
-**Objective:** Prevent spam and DoS attacks
-- Add per-session message rate limiting (10 messages/second max)
-- Implement room creation throttling (1 room/minute per IP)
-- Add exponential backoff for reconnection attempts
+- Join hardening and basic security
+  - Increase room code complexity (e.g., 6-digit) and update `ValidationService`, UI input, and server constants.
+  - Add IP throttling to `join_room` similar to `create_room`.
+  - Restrict CORS in release builds (keep `anyHost()` only in dev).
+  - Acceptance: Old 4-digit codes rejected; join attempts rate-limited; release build blocks non-whitelisted origins.
 
-#### 8. Fix Memory Leaks
-**Objective:** Prevent resource exhaustion
-- Schedule periodic cleanup of stale rooms (every 5 minutes)
-- Implement proper session cleanup on all disconnect paths
-- Add connection pool limits and monitoring
+- Idempotency and acknowledgements
+  - Add `opId` to client requests; server maintains per-session LRU to deduplicate.
+  - Success/Error responses echo `opId`; client clears queued op upon ack.
+  - Acceptance: Replayed requests don’t duplicate effects; client UI never double-executes on reconnect.
 
-#### 9. Address State Synchronization Issues
-**Objective:** Prevent frontend-backend drift
-- Add state versioning to detect and resolve conflicts
-- Implement client-side state validation
-- Add retry logic with exponential backoff for failed broadcasts
-
-#### 10. Improve Error Handling
-**Objective:** Prevent uncaught exceptions
-- Wrap all message handlers in try-catch with proper error responses
-- Implement dead letter queue for failed broadcasts
-- Add structured error logging with context
+- Payload/frame safety
+  - Raise limits to 64KB via `ServerConfig` and env overrides; audit largest `GameState` payloads.
+  - Optional: Begin shaping incremental updates for large changes (non-blocking spike).
+  - Acceptance: Full-state updates do not exceed configured ceilings in typical 4-player scenarios.
 
 ---
 
-## Phase 3: Medium Priority Fixes (Quality of Life)
-**Focus:** Improve user experience and reliability
+## Phase 2: High (stability and visibility)
 
-### 📋 **Planned Tasks:**
+- Error code standardization
+  - Ensure all `sendError` paths set specific `ErrorCode` values (VALIDATION, NOT_FOUND, AUTHZ, CONFLICT, TIMEOUT, UNKNOWN).
+  - Client maps codes to friendly messages and recovery suggestions.
+  - Acceptance: 100% of error responses include `code`; client-side mapping table has no fallbacks for expected errors.
 
-#### 11. Enhance Reconnection Strategy
-**Objective:** Improve connection reliability
-- Implement jittered exponential backoff for reconnections
-- Add client-side ping/pong with 30-second intervals
-- Buffer outgoing messages during disconnect (max 10 messages)
+- Observability and health
+  - Add lightweight metrics (rooms, players, message rates, error counts, dead-letter size) and correlation IDs (room/session).
+  - Implement `/health` and `/ready` HTTP endpoints.
+  - Acceptance: Metrics exposed; dashboards show trends; health checks integrate with local runner.
 
-#### 12. Add Input Validation and Sanitization
-**Objective:** Improve data integrity
-- Validate message payload sizes (max 10KB)
-- Sanitize all user inputs (player names, room codes)
-- Add comprehensive validation for all game operations
-
-#### 13. Implement Operation Timeouts
-**Objective:** Prevent hanging operations
-- Add 10-second timeout for all game operations
-- Implement cancellation tokens for long-running operations
-- Add timeout handling for WebSocket sends
-
-#### 14. Improve Error Messages
-**Objective:** Better user experience
-- Replace generic errors with specific, actionable messages
-- Add error codes for programmatic handling
-- Implement client-side error recovery suggestions
+- Lifecycle correctness
+  - Tests for join/leave, host migration, and reconnection restoring presence state.
+  - Acceptance: Automated tests cover presence and host migration flows.
 
 ---
 
-## Phase 4: Low Priority Fixes (Scalability & Observability)
-**Focus:** Long-term maintainability
+## Phase 3: Medium (UX and correctness)
 
-### 📋 **Planned Tasks:**
+- Client connection FSM
+  - Explicit states: connecting, connected, reconnecting, offline; cap retries and surface retry UI.
+  - Acceptance: UI shows accurate connection state; retries bounded with user control.
 
-#### 15. Add Horizontal Scaling Support
-**Objective:** Enable multi-instance deployment
-- Design shared storage abstraction (Redis/database)
-- Implement distributed locks for multi-instance deployment
-- Add instance health checks and load balancing
+- Validation coverage tightening
+  - Enforce `validateCardCount` and expand `RoomSettings` rules; centralize validation calls.
+  - Acceptance: Invalid inputs rejected consistently with `VALIDATION` code.
 
-#### 16. Implement Persistence
-**Objective:** Survive server restarts
-- Add database layer for game state persistence
-- Implement game state recovery on server restart
-- Add backup and restore functionality
-
-#### 17. Add Comprehensive Observability
-**Objective:** Enable monitoring and debugging
-- Implement structured logging with correlation IDs
-- Add metrics collection (active rooms, message rates, errors)
-- Create monitoring dashboards and alerts
-
-#### 18. Refactor Handler Pattern
-**Objective:** Improve maintainability
-- Extract common validation logic into middleware
-- Implement centralized authentication/authorization
-- Add request tracing and performance monitoring
+- Test coverage expansion
+  - Add unit/integration tests for move/recall/deal edge cases, dead-letter behavior, and session cleanup.
+  - Acceptance: New tests pass and reproduce fixed issues.
 
 ---
 
-## Testing Strategy
+## Phase 4: Long-term (scale and resilience)
 
-### Unit Tests (Per Phase)
-- Test atomic operations under concurrent load
-- Validate input sanitization and bounds checking
-- Test error handling paths
+- Persistence and recovery
+  - Introduce durable storage for rooms/game state; implement recovery on restart.
+  - Acceptance: Restart preserves active rooms; data model migrations documented.
 
-### Integration Tests
-- WebSocket flow testing with simulated network conditions
-- Concurrent user simulation (4+ players simultaneous actions)
-- Reconnection and state recovery testing
+- Horizontal scaling
+  - Shared state backend and distributed locking; sticky sessions at ingress.
+  - Acceptance: Two server instances handle a single room correctly under load.
 
-### Load Testing
-- Rate limiting validation (spam protection)
-- Memory leak detection (long-running tests)
-- Performance benchmarking
+- Dead-letter reprocessor
+  - Background job to retry DLQ messages with backoff; alert if stuck.
+  - Acceptance: DLQ drains when recipients reconnect; metrics reflect retries.
 
----
-
-## Rollback and Monitoring Plan
-
-### Rollback Strategy
-- Feature flags for each major change
-- Database migrations with rollback scripts
-- Blue-green deployment capability
-
-### Monitoring
-- Error rate alerts (>5% error rate)
-- Performance degradation alerts (response time >2s)
-- Memory usage monitoring with alerts
-
-### Success Metrics
-- Zero race condition incidents in production
-- <1% message loss during network hiccups
-- <30 second reconnection time
-- 99.9% uptime target
+- Incremental update protocol
+  - Reduce `GameState` payloads via diffs or event streams; versioned schema.
+  - Acceptance: Average bytes/update reduced significantly without correctness loss.
 
 ---
 
-## Current Status Summary
+## Testing strategy
+- Unit: validation, handler error paths, locking contention timeouts, idempotency dedup store, presence broadcast.
+- Integration: 4-player flows (deal/play/move/recall), disconnect/reconnect, join/leave spam protections.
+- Load: message rate limiting, memory stability over long sessions, DLQ behavior.
 
-### ✅ **Fully Completed:**
-- Phase 1 Foundation (Atomic Operations Infrastructure)
-- Version tracking and thread-safety foundation
-- All GameService methods updated with versioning
+## Rollout and config
+- Feature flags for presence broadcast and idempotency.
+- Environment-configurable limits (frame/payload, rate windows, retries).
+- Release gating with staged rollout.
 
-### ✅ **Fully Completed:**
-- Phase 1 Foundation (Atomic Operations Infrastructure)
-- Version tracking and thread-safety foundation
-- All GameService methods updated with versioning
-- Phase 1 Handler Updates (Race Conditions)
-- Phase 1 Session Management
-- Phase 1 Input Validation
-
-### 📋 **Ready for Implementation:**
-- Phase 2: Rate Limiting & Memory Management
-- Phase 3: UX & Reliability Improvements
-- Phase 4: Scalability & Observability
-
-### 🎯 **Next Priority:**
-Phase 1 critical fixes are complete! Proceed to Phase 2 for production stability improvements including rate limiting and memory leak prevention.
+## Current status and next steps
+- Baseline protections are in place as listed above.
+- Next up: Phase 1 tasks, starting with presence/host-migration on disconnect and join hardening.
 
 ---
 
-*Last Updated: 2025-11-26*
-*Document tracks implementation progress and serves as roadmap for remaining work.*
+Last Updated: 2025-11-27

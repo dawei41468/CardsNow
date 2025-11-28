@@ -2,6 +2,7 @@ package com.example.cardsnow
 
 import android.content.res.Configuration
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -28,6 +29,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        println("Configuration changed: ${newConfig.screenHeightDp}x${newConfig.screenWidthDp}, orientation=${newConfig.orientation}")
+        if (ClientConfig.IS_DEBUG) {
+            Log.d("MainActivity", "Configuration changed: ${newConfig.screenHeightDp}x${newConfig.screenWidthDp}, orientation=${newConfig.orientation}")
+        }
     }
 }

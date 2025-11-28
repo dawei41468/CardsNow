@@ -42,6 +42,8 @@ import com.example.cardsnow.ui.components.ActionButton
 import com.example.cardsnow.ui.components.CardHand
 import com.example.cardsnow.ui.components.ErrorMessage
 import com.example.cardsnow.ui.components.SuccessMessage
+import android.util.Log
+import com.example.cardsnow.ClientConfig
 import kotlin.math.min
 
 @Composable
@@ -61,7 +63,7 @@ fun GameRoomScreen(viewModel: KtorViewModel, activity: MainActivity) {
     LaunchedEffect(gameState.roomCode) {
         if (gameState.roomCode.isNotEmpty() && !gameState.gameStarted) {
             viewModel.refreshPlayers()
-            println("Forced player refresh for deal range, players: ${gameState.players}")
+            if (ClientConfig.IS_DEBUG) Log.d("GameRoomScreen", "Forced player refresh for deal range, players: ${gameState.players}")
         }
     }
 

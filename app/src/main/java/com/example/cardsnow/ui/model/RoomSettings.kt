@@ -1,4 +1,4 @@
-package com.example.cardsnow
+package com.example.cardsnow.ui.model
 
 import kotlinx.serialization.Serializable
 

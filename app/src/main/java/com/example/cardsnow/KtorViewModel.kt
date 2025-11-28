@@ -4,6 +4,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import android.util.Log
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.websocket.WebSockets
@@ -12,16 +13,17 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
+import io.ktor.websocket.send
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import java.util.UUID
+import com.example.cardsnow.wire.WebSocketMessage as WireMessage
+import com.example.cardsnow.wire.RoomSettings as WireRoomSettings
+import kotlin.random.Random
+import com.example.cardsnow.ws.WsClient
 
 private val json = Json {
     classDiscriminator = "messageType"
@@ -57,7 +59,8 @@ data class GameState(
     val errorType: ErrorType = ErrorType.NONE,
     val successMessage: String = "",
     val isConnected: Boolean = false,
-    val showNewHostDialog: Boolean = false
+    val showNewHostDialog: Boolean = false,
+    val lastVersion: Long = 0
 )
 
 enum class ErrorType {
@@ -69,12 +72,18 @@ class KtorViewModel : ViewModel() {
     private val client = HttpClient(CIO) {
         install(WebSockets)
         engine {
-            requestTimeout = 30000
+            requestTimeout = ClientConfig.REQUEST_TIMEOUT_MS
         }
     }
     
     private var webSocketSession: WebSocketSession? = null
     private var reconnectJob: Job? = null
+    private var reconnectAttempts: Int = 0
+    private var sessionId: String? = null
+    private var pingJob: Job? = null
+    private val outgoingQueue: ArrayDeque<WireMessage> = ArrayDeque()
+    private var wsClient: WsClient = WsClient.Session { webSocketSession }
+    private var flushAllowed: Boolean = false
     
     private val _gameState = mutableStateOf(GameState())
     val gameState: State<GameState> = _gameState
@@ -115,7 +124,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             try {
-                client.webSocket("ws://10.0.2.2:8080/ws") {
+                client.webSocket(ClientConfig.WS_URL) {
                     webSocketSession = this
                     _gameState.value = _gameState.value.copy(
                         isConnected = true,
@@ -123,6 +132,27 @@ class KtorViewModel : ViewModel() {
                         errorMessage = "",
                         errorType = ErrorType.NONE
                     )
+                    reconnectAttempts = 0
+                    flushAllowed = false
+                    pingJob?.cancel()
+                    pingJob = viewModelScope.launch {
+                        while (_gameState.value.isConnected) {
+                            delay(ClientConfig.PING_INTERVAL_MS)
+                            runCatching { wsClient.send(Frame.Ping(byteArrayOf())) }
+                                .onFailure { if (ClientConfig.IS_DEBUG) Log.d(TAG, "Ping failed: ${it.message}") }
+                        }
+                    }
+                    if (_gameState.value.roomCode.isNotBlank() &&
+                        _gameState.value.playerName.isNotBlank() &&
+                        sessionId != null
+                    ) {
+                        val message = WireMessage.Reconnect(
+                            roomCode = _gameState.value.roomCode,
+                            playerName = _gameState.value.playerName,
+                            sessionId = sessionId!!
+                        )
+                        sendMessage(message)
+                    }
                     
                     // Start listening for messages
                     for (frame in incoming) {
@@ -130,6 +160,9 @@ class KtorViewModel : ViewModel() {
                             handleIncomingMessage(frame.readText())
                         }
                     }
+                    _gameState.value = _gameState.value.copy(isConnected = false)
+                    pingJob?.cancel()
+                    scheduleReconnect()
                 }
             } catch (e: Exception) {
                 _gameState.value = _gameState.value.copy(
@@ -145,8 +178,11 @@ class KtorViewModel : ViewModel() {
 
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
+        val attempt = (++reconnectAttempts).coerceAtLeast(1)
+        val backoff = ClientConfig.RECONNECT_BACKOFF_BASE_MS * (1L shl attempt.coerceAtMost(ClientConfig.RECONNECT_BACKOFF_MAX_SHIFT))
+        val delayMs = minOf(backoff, ClientConfig.RECONNECT_BACKOFF_MAX_MS) + Random.nextLong(0, ClientConfig.RECONNECT_JITTER_MAX_MS + 1)
         reconnectJob = viewModelScope.launch {
-            delay(5000) // Wait 5 seconds before reconnecting
+            delay(delayMs)
             if (!_gameState.value.isConnected) {
                 connectToServer()
             }
@@ -155,128 +191,115 @@ class KtorViewModel : ViewModel() {
 
     private fun handleIncomingMessage(message: String) {
         try {
-            println("Received WebSocket message: $message")
-            
-            // Parse the base message to determine type
-            val jsonElement = json.parseToJsonElement(message)
-            val jsonObject = jsonElement.jsonObject
-            val messageType = jsonObject["messageType"]?.jsonPrimitive?.content ?: return
-            
-            when (messageType) {
-                "success" -> {
-                    val successMessage = jsonObject["message"]?.jsonPrimitive?.content ?: ""
-                    handleSuccess(successMessage)
-                }
-                "error" -> {
-                    val errorMessage = jsonObject["message"]?.jsonPrimitive?.content ?: ""
-                    val errorTypeStr = jsonObject["errorType"]?.jsonPrimitive?.content ?: "TRANSIENT"
-                    val errorType = ErrorType.valueOf(errorTypeStr)
+            if (ClientConfig.IS_DEBUG) Log.d(TAG, "Received WebSocket message: $message")
+            when (val wsMessage = json.decodeFromString<WireMessage>(message)) {
+                is WireMessage.Success -> handleSuccess(wsMessage.message)
+                is WireMessage.Error -> {
                     _gameState.value = _gameState.value.copy(isLoadingGeneral = false)
-                    showError(errorMessage, errorType)
+                    val type = runCatching { ErrorType.valueOf(wsMessage.type.name) }
+                        .getOrDefault(ErrorType.TRANSIENT)
+                    val friendly = when (wsMessage.code) {
+                        com.example.cardsnow.wire.ErrorCode.RATE_LIMITED -> "You're sending too fast. Please wait a moment."
+                        com.example.cardsnow.wire.ErrorCode.PAYLOAD_TOO_LARGE -> "Message too large."
+                        com.example.cardsnow.wire.ErrorCode.TIMEOUT -> "Operation timed out. Please try again."
+                        com.example.cardsnow.wire.ErrorCode.INVALID_FORMAT -> "Invalid request."
+                        com.example.cardsnow.wire.ErrorCode.UNKNOWN, null -> wsMessage.message
+                    }
+                    showError(friendly, type)
                 }
-                "game_state_update" -> {
-                    handleGameStateUpdate(jsonObject)
-                }
-                "player_joined" -> {
-                    val players = jsonObject["players"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-                    handlePlayerJoined(players)
-                }
-                "player_left" -> {
-                    val playerName = jsonObject["playerName"]?.jsonPrimitive?.content ?: ""
-                    val newHost = jsonObject["newHost"]?.jsonPrimitive?.content
-                    handlePlayerLeft(playerName, newHost)
-                }
-                "room_created" -> {
-                    val roomCode = jsonObject["roomCode"]?.jsonPrimitive?.content ?: ""
-                    val players = jsonObject["players"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+                is WireMessage.GameStateUpdate -> handleGameStateUpdate(wsMessage)
+                is WireMessage.PlayerJoined -> handlePlayerJoined(wsMessage.players)
+                is WireMessage.PlayerLeft -> handlePlayerLeft(wsMessage.playerName, wsMessage.newHost)
+                is WireMessage.RoomCreated -> {
                     _gameState.value = _gameState.value.copy(
-                        roomCode = roomCode,
-                        players = players
+                        roomCode = wsMessage.roomCode,
+                        players = wsMessage.players,
+                        screen = "room",
+                        isLoadingGeneral = false
                     )
+                }
+                is WireMessage.SessionCreated -> {
+                    if (wsMessage.sessionId.isNotBlank()) {
+                        sessionId = wsMessage.sessionId
+                    }
+                    _gameState.value = _gameState.value.copy(
+                        screen = "room",
+                        isLoadingGeneral = false
+                    )
+                    flushAllowed = true
+                    flushOutgoingQueue()
+                }
+                else -> {
+                    // Messages handled elsewhere or not needed by client
                 }
             }
         } catch (e: Exception) {
-            println("Error parsing message: ${e.message}")
+            Log.e(TAG, "Error parsing message: ${e.message}")
             showError("Invalid server message", ErrorType.TRANSIENT)
         }
     }
 
-    private fun handleSuccess(message: String) {
-        // Check if this is a room creation success message
-        if (message.startsWith("Room ") && message.endsWith(" created!")) {
-            val roomCode = message.substring(5, message.length - 9).trim()
-            _gameState.value = _gameState.value.copy(
-                roomCode = roomCode,
-                players = listOf(_gameState.value.playerName), // Add host to players list
-                screen = "room",
-                successMessage = message,
-                errorMessage = "",
-                errorType = ErrorType.NONE,
-                isLoadingGeneral = false
-            )
-        } else if (message.contains(" room ") && message.endsWith("!")) {
-            // For join or rejoin success
-            _gameState.value = _gameState.value.copy(
-                screen = "room",
-                successMessage = message,
-                errorMessage = "",
-                errorType = ErrorType.NONE,
-                isLoadingGeneral = false
-            )
-        } else {
-            _gameState.value = _gameState.value.copy(
-                successMessage = message,
-                errorMessage = "",
-                errorType = ErrorType.NONE
-            )
-        }
-
-        // Clear success message after delay
-        viewModelScope.launch {
-            delay(2000)
-            if (_gameState.value.successMessage == message) {
-                _gameState.value = _gameState.value.copy(successMessage = "")
-            }
-        }
-    }
-
-    private fun handleGameStateUpdate(jsonObject: kotlinx.serialization.json.JsonObject) {
+    private fun handleGameStateUpdate(message: WireMessage.GameStateUpdate) {
         try {
-            val roomCode = jsonObject["roomCode"]?.jsonPrimitive?.content ?: return
-            
-            // Parse game state
-            val gameStateJson = jsonObject["gameState"]?.jsonObject
-            val deckSize = gameStateJson?.get("deck")?.jsonArray?.size ?: 0
-            val table = parseTable(gameStateJson?.get("table")?.jsonArray)
-            val discardPile = parseCards(gameStateJson?.get("discardPile")?.jsonArray)
-            val lastPlayedJson = gameStateJson?.get("lastPlayed")?.jsonObject
-            val lastPlayedPlayer = lastPlayedJson?.get("player")?.jsonPrimitive?.content ?: ""
-            val lastPlayedCardIds = lastPlayedJson?.get("cardIds")?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            val lastDiscardedJson = gameStateJson?.get("lastDiscarded")?.jsonObject
-            val lastDiscardedPlayer = lastDiscardedJson?.get("player")?.jsonPrimitive?.content ?: ""
-            val lastDiscardedCardIds = lastDiscardedJson?.get("cardIds")?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
-            
-            // Parse players
-            val playersJson = jsonObject["players"]?.jsonObject
-            val players = playersJson?.keys?.toList() ?: emptyList()
-            
-            // Find current player
-            val currentPlayer = playersJson?.entries?.find { 
-                it.value.jsonObject["name"]?.jsonPrimitive?.content == _gameState.value.playerName 
+            val roomCode = message.roomCode
+            val serverState = message.gameState
+            val version = serverState.version
+
+            // Ignore only strictly older updates unless this looks like a full reset
+            val isResetState = serverState.deck.isEmpty() &&
+                    serverState.discardPile.isEmpty() &&
+                    (serverState.table.isEmpty() || serverState.table.all { it.isEmpty() }) &&
+                    message.players.values.all { it.hand.isEmpty() }
+            if (version < _gameState.value.lastVersion && !isResetState) {
+                if (ClientConfig.IS_DEBUG) Log.d(TAG, "Ignoring older game state update: version $version < ${_gameState.value.lastVersion}")
+                return
             }
-            
-            val isHost = currentPlayer?.value?.jsonObject?.get("isHost")?.jsonPrimitive?.booleanOrNull ?: false
-            val myHand = parseCards(currentPlayer?.value?.jsonObject?.get("hand")?.jsonArray)
-            
+
+            val deckSize = serverState.deck.size
+            val table = serverState.table.map { pile ->
+                pile.map { cardDto ->
+                    val resourceId = cardResourceMap["${cardDto.suit}_${cardDto.rank}"] ?: R.drawable.card_back_red
+                    Card(cardDto.suit, cardDto.rank, resourceId, cardDto.id)
+                }
+            }
+            val discardPile = serverState.discardPile.map { cardDto ->
+                val resourceId = cardResourceMap["${cardDto.suit}_${cardDto.rank}"] ?: R.drawable.card_back_red
+                Card(cardDto.suit, cardDto.rank, resourceId, cardDto.id)
+            }
+            val lastPlayedPlayer = serverState.lastPlayed.player
+            val lastPlayedCardIds = serverState.lastPlayed.cardIds
+            val lastDiscardedPlayer = serverState.lastDiscarded.player
+            val lastDiscardedCardIds = serverState.lastDiscarded.cardIds
+
+            // Basic client-side validation
+            if (deckSize < 0) {
+                Log.w(TAG, "Invalid game state: negative deck size $deckSize")
+                showError("Invalid game state received", ErrorType.CRITICAL)
+                return
+            }
+            if (table.any { it.isEmpty() }) {
+                Log.w(TAG, "Invalid game state: empty pile in table")
+                showError("Invalid game state received", ErrorType.CRITICAL)
+                return
+            }
+
+            // Parse players
+            val players = message.players.values.map { it.name }
+
+            // Find current player
+            val currentPlayer = message.players.values.find { it.name == _gameState.value.playerName }
+
+            val isHost = currentPlayer?.isHost ?: false
+            val myHand = currentPlayer?.hand?.map { cardDto ->
+                val resourceId = cardResourceMap["${cardDto.suit}_${cardDto.rank}"] ?: R.drawable.card_back_red
+                Card(cardDto.suit, cardDto.rank, resourceId, cardDto.id)
+            } ?: emptyList()
+
             // Calculate other players' hand sizes
             val otherPlayersHandSizes = mutableMapOf<String, Int>()
-            playersJson?.entries?.forEach { entry ->
-                val playerName = entry.value.jsonObject["name"]?.jsonPrimitive?.content
-                if (playerName != _gameState.value.playerName) {
-                    val handSize = entry.value.jsonObject["hand"]?.jsonArray?.size ?: 0
-                    if (playerName != null) {
-                        otherPlayersHandSizes[playerName] = handSize
-                    }
+            message.players.values.forEach { player ->
+                if (player.name != _gameState.value.playerName) {
+                    otherPlayersHandSizes[player.name] = player.hand.size
                 }
             }
             val lastPileCardIds = if (table.isNotEmpty()) table.last().map { it.id } else emptyList()
@@ -288,12 +311,16 @@ class KtorViewModel : ViewModel() {
                     discardPile.size >= lastDiscardedCardIds.size &&
                     discardPile.takeLast(lastDiscardedCardIds.size).map { it.id } == lastDiscardedCardIds
             val canRecall = pileEligible || discardEligible
-            
+
+            val started = deckSize > 0 || table.any { it.isNotEmpty() } || discardPile.isNotEmpty() ||
+                    message.players.values.any { it.hand.isNotEmpty() }
+
             _gameState.value = _gameState.value.copy(
                 roomCode = roomCode,
                 players = players,
                 isHost = isHost,
-                gameStarted = true,
+                gameStarted = started,
+                screen = "room",
                 myHand = myHand,
                 table = table,
                 discardPile = discardPile,
@@ -305,37 +332,14 @@ class KtorViewModel : ViewModel() {
                 lastDiscardedPlayer = lastDiscardedPlayer,
                 lastDiscardedCardIds = lastDiscardedCardIds,
                 canRecall = canRecall,
-                isLoadingGeneral = false
+                isLoadingGeneral = false,
+                lastVersion = version
             )
+            flushAllowed = true
+            flushOutgoingQueue()
         } catch (e: Exception) {
-            println("Error handling game state update: ${e.message}")
+            Log.e(TAG, "Error handling game state update: ${e.message}")
             showError("Failed to update game state", ErrorType.TRANSIENT)
-        }
-    }
-
-    private fun parseTable(tableJson: kotlinx.serialization.json.JsonArray?): List<List<Card>> {
-        if (tableJson == null) return emptyList()
-        
-        return tableJson.map { pileElement ->
-            parseCards(pileElement.jsonArray)
-        }
-    }
-
-    private fun parseCards(cardsJson: kotlinx.serialization.json.JsonArray?): List<Card> {
-        if (cardsJson == null) return emptyList()
-        
-        return cardsJson.mapNotNull { cardElement ->
-            try {
-                val cardObj = cardElement.jsonObject
-                val suit = cardObj["suit"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                val rank = cardObj["rank"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                val id = cardObj["id"]?.jsonPrimitive?.content ?: UUID.randomUUID().toString()
-                
-                val resourceId = cardResourceMap["${suit}_$rank"] ?: R.drawable.card_back_red
-                Card(suit, rank, resourceId, id)
-            } catch (_: Exception) {
-                null
-            }
         }
     }
 
@@ -374,13 +378,13 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val settings = RoomSettings(
+            val settings = WireRoomSettings(
                 numDecks = _gameState.value.numDecks,
                 includeJokers = _gameState.value.includeJokers,
                 dealCount = 0
             )
             
-            val message = WebSocketMessage.CreateRoom(settings, _gameState.value.hostName.trim())
+            val message = WireMessage.CreateRoom(settings, _gameState.value.hostName.trim())
             sendMessage(message)
             
             _gameState.value = _gameState.value.copy(
@@ -409,7 +413,7 @@ class KtorViewModel : ViewModel() {
                 return@launch
             }
             
-            val message = WebSocketMessage.JoinRoom(trimmedCode, trimmedName)
+            val message = WireMessage.JoinRoom(trimmedCode, trimmedName)
             sendMessage(message)
             
             _gameState.value = _gameState.value.copy(
@@ -426,7 +430,7 @@ class KtorViewModel : ViewModel() {
             
             val roomCode = _gameState.value.roomCode
             if (roomCode.isNotEmpty()) {
-                val message = WebSocketMessage.StartGame(roomCode)
+                val message = WireMessage.StartGame(roomCode)
                 sendMessage(message)
             }
             
@@ -457,7 +461,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isPlayingCards = true)
             
-            val message = WebSocketMessage.PlayCards(
+            val message = WireMessage.PlayCards(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName,
                 cardIds = cardsToPlay.map { it.id }
@@ -484,7 +488,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isPlayingCards = true)
             
-            val message = WebSocketMessage.DiscardCards(
+            val message = WireMessage.DiscardCards(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName,
                 cardIds = cardsToDiscard.map { it.id }
@@ -502,7 +506,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isDrawingCard = true)
             
-            val message = WebSocketMessage.DrawCard(
+            val message = WireMessage.DrawCard(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName
             )
@@ -516,7 +520,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isDrawingCard = true)
             
-            val message = WebSocketMessage.DrawFromDiscard(
+            val message = WireMessage.DrawFromDiscard(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName
             )
@@ -530,7 +534,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val message = WebSocketMessage.ShuffleDeck(
+            val message = WireMessage.ShuffleDeck(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName
             )
@@ -544,7 +548,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val message = WebSocketMessage.DealCards(
+            val message = WireMessage.DealCards(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName,
                 count = count
@@ -568,7 +572,7 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val message = WebSocketMessage.MoveCards(
+            val message = WireMessage.MoveCards(
                 roomCode = _gameState.value.roomCode,
                 fromPlayer = _gameState.value.playerName,
                 toPlayer = targetPlayer,
@@ -596,13 +600,13 @@ class KtorViewModel : ViewModel() {
                     _gameState.value.discardPile.takeLast(_gameState.value.lastDiscardedCardIds.size).map { it.id } == _gameState.value.lastDiscardedCardIds
 
             if (discardEligible) {
-                val message = WebSocketMessage.RecallLastDiscard(
+                val message = WireMessage.RecallLastDiscard(
                     roomCode = _gameState.value.roomCode,
                     playerName = _gameState.value.playerName
                 )
                 sendMessage(message)
             } else if (pileEligible) {
-                val message = WebSocketMessage.RecallLastPile(
+                val message = WireMessage.RecallLastPile(
                     roomCode = _gameState.value.roomCode,
                     playerName = _gameState.value.playerName
                 )
@@ -632,7 +636,7 @@ class KtorViewModel : ViewModel() {
 
     private fun updateHandOrder(cardIds: List<String>) {
         viewModelScope.launch {
-            val message = WebSocketMessage.ReorderHand(
+            val message = WireMessage.ReorderHand(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName,
                 cardIds = cardIds
@@ -644,14 +648,14 @@ class KtorViewModel : ViewModel() {
     fun refreshPlayers() {
         // This method is called from GameRoomScreen but doesn't need to do anything
         // since player updates are handled via WebSocket messages
-        println("refreshPlayers called - players are updated via WebSocket")
+        if (ClientConfig.IS_DEBUG) Log.d(TAG, "refreshPlayers called - players are updated via WebSocket")
     }
 
     fun restartGame() {
         viewModelScope.launch {
             _gameState.value = _gameState.value.copy(isLoadingGeneral = true)
             
-            val message = WebSocketMessage.RestartGame(
+            val message = WireMessage.RestartGame(
                 roomCode = _gameState.value.roomCode,
                 playerName = _gameState.value.playerName
             )
@@ -664,11 +668,26 @@ class KtorViewModel : ViewModel() {
     // Utility methods
     fun showError(message: String, type: ErrorType = ErrorType.TRANSIENT) {
         _gameState.value = _gameState.value.copy(errorMessage = message, errorType = type)
-        
+
         if (type == ErrorType.TRANSIENT) {
             viewModelScope.launch {
-                delay(3000)
+                delay(ClientConfig.ERROR_AUTO_DISMISS_MS)
                 clearError()
+            }
+        }
+    }
+
+    private fun handleSuccess(message: String) {
+        _gameState.value = _gameState.value.copy(
+            successMessage = message,
+            errorMessage = "",
+            errorType = ErrorType.NONE
+        )
+
+        viewModelScope.launch {
+            delay(ClientConfig.SUCCESS_AUTO_DISMISS_MS)
+            if (_gameState.value.successMessage == message) {
+                _gameState.value = _gameState.value.copy(successMessage = "")
             }
         }
     }
@@ -718,25 +737,89 @@ class KtorViewModel : ViewModel() {
         _gameState.value = _gameState.value.copy(includeJokers = newIncludeJokers)
     }
 
-    private fun sendMessage(message: WebSocketMessage) {
+    private fun sendMessage(message: WireMessage) {
         viewModelScope.launch {
             try {
-                val jsonString = json.encodeToString(message)
-                println("Sending message: $jsonString")
-                webSocketSession?.send(Frame.Text(jsonString))
+                val connected = wsClient.isConnected && _gameState.value.isConnected
+                if (!connected) {
+                    if (outgoingQueue.size >= ClientConfig.OUTGOING_BUFFER_MAX) {
+                        outgoingQueue.removeFirst()
+                        if (ClientConfig.IS_DEBUG) Log.d(TAG, "Outgoing buffer full, dropping oldest message")
+                    }
+                    outgoingQueue.addLast(message)
+                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Queued message: ${message::class.simpleName}")
+                    return@launch
+                }
+                val jsonString = json.encodeToString(WireMessage.serializer(), message)
+                if (ClientConfig.IS_DEBUG) Log.d(TAG, "Sending message: $jsonString")
+                wsClient.send(Frame.Text(jsonString))
             } catch (e: Exception) {
-                println("Error sending message: ${e.message}")
+                Log.e(TAG, "Error sending message: ${e.message}")
                 showError("Failed to send message: ${e.message}", ErrorType.TRANSIENT)
             }
+        }
+    }
+
+    private fun flushOutgoingQueue() {
+        viewModelScope.launch {
+            while (outgoingQueue.isNotEmpty() && flushAllowed && _gameState.value.isConnected && wsClient.isConnected) {
+                val msg = outgoingQueue.removeFirst()
+                runCatching {
+                    val jsonString = json.encodeToString(WireMessage.serializer(), msg)
+                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Flushing queued message: $jsonString")
+                    wsClient.send(Frame.Text(jsonString))
+                }.onFailure {
+                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Failed to flush queued message: ${it.message}")
+                    outgoingQueue.addFirst(msg)
+                    return@launch
+                }
+            }
+        }
+    }
+
+    fun setWsClientForTest(client: WsClient) { this.wsClient = client }
+    fun setConnectedForTest(connected: Boolean) { _gameState.value = _gameState.value.copy(isConnected = connected) }
+    fun enqueueForTest(message: WireMessage) {
+        if (outgoingQueue.size >= ClientConfig.OUTGOING_BUFFER_MAX) {
+            outgoingQueue.removeFirst()
+        }
+        outgoingQueue.addLast(message)
+    }
+    suspend fun flushOutgoingQueueForTest() {
+        while (outgoingQueue.isNotEmpty() && wsClient.isConnected) {
+            val msg = outgoingQueue.removeFirst()
+            val jsonString = json.encodeToString(WireMessage.serializer(), msg)
+            wsClient.send(Frame.Text(jsonString))
+        }
+    }
+
+    suspend fun pingOnceForTest() {
+        if (_gameState.value.isConnected) {
+            wsClient.send(Frame.Ping(byteArrayOf()))
+        }
+    }
+
+    fun setFlushAllowedForTest(allowed: Boolean) { this.flushAllowed = allowed }
+    fun triggerFlushForTest() { flushOutgoingQueue() }
+    suspend fun flushOutgoingQueueRespectingGateForTest() {
+        while (outgoingQueue.isNotEmpty() && flushAllowed && wsClient.isConnected) {
+            val msg = outgoingQueue.removeFirst()
+            val jsonString = json.encodeToString(WireMessage.serializer(), msg)
+            wsClient.send(Frame.Text(jsonString))
         }
     }
 
     override fun onCleared() {
         super.onCleared()
         reconnectJob?.cancel()
+        pingJob?.cancel()
         viewModelScope.launch {
             webSocketSession?.close()
             client.close()
         }
+    }
+
+    companion object {
+        private const val TAG = "KtorViewModel"
     }
 }
