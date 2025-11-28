@@ -1,10 +1,12 @@
 package com.example.cardsnow
 
+import android.util.Log
 import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import android.util.Log
+import com.example.cardsnow.ws.OpAckTracker
+import com.example.cardsnow.ws.WsClient
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.websocket.WebSockets
@@ -13,17 +15,16 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
-import io.ktor.websocket.send
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import com.example.cardsnow.wire.WebSocketMessage as WireMessage
-import com.example.cardsnow.wire.RoomSettings as WireRoomSettings
 import kotlin.random.Random
-import com.example.cardsnow.ws.WsClient
+import com.example.cardsnow.wire.RoomSettings as WireRoomSettings
+import com.example.cardsnow.wire.WebSocketMessage as WireMessage
+import com.example.cardsnow.wire.ErrorType as WireErrorType
 
 private val json = Json {
     classDiscriminator = "messageType"
@@ -75,7 +76,7 @@ class KtorViewModel : ViewModel() {
             requestTimeout = ClientConfig.REQUEST_TIMEOUT_MS
         }
     }
-    
+
     private var webSocketSession: WebSocketSession? = null
     private var reconnectJob: Job? = null
     private var reconnectAttempts: Int = 0
@@ -84,6 +85,7 @@ class KtorViewModel : ViewModel() {
     private val outgoingQueue: ArrayDeque<WireMessage> = ArrayDeque()
     private var wsClient: WsClient = WsClient.Session { webSocketSession }
     private var flushAllowed: Boolean = false
+    private val opAckTracker = OpAckTracker(viewModelScope)
     
     private val _gameState = mutableStateOf(GameState())
     val gameState: State<GameState> = _gameState
@@ -193,19 +195,27 @@ class KtorViewModel : ViewModel() {
         try {
             if (ClientConfig.IS_DEBUG) Log.d(TAG, "Received WebSocket message: $message")
             when (val wsMessage = json.decodeFromString<WireMessage>(message)) {
-                is WireMessage.Success -> handleSuccess(wsMessage.message)
+                is WireMessage.Success -> {
+                    viewModelScope.launch { opAckTracker.onSuccess(wsMessage.opId, wsMessage.message) }
+                    handleSuccess(wsMessage.message)
+                }
                 is WireMessage.Error -> {
                     _gameState.value = _gameState.value.copy(isLoadingGeneral = false)
                     val type = runCatching { ErrorType.valueOf(wsMessage.type.name) }
-                        .getOrDefault(ErrorType.TRANSIENT)
+                        .getOrElse { ErrorType.TRANSIENT }
                     val friendly = when (wsMessage.code) {
-                        com.example.cardsnow.wire.ErrorCode.RATE_LIMITED -> "You're sending too fast. Please wait a moment."
+                        com.example.cardsnow.wire.ErrorCode.RATE_LIMITED -> "You're doing that too fast."
                         com.example.cardsnow.wire.ErrorCode.PAYLOAD_TOO_LARGE -> "Message too large."
                         com.example.cardsnow.wire.ErrorCode.TIMEOUT -> "Operation timed out. Please try again."
                         com.example.cardsnow.wire.ErrorCode.INVALID_FORMAT -> "Invalid request."
+                        com.example.cardsnow.wire.ErrorCode.VALIDATION -> wsMessage.message
+                        com.example.cardsnow.wire.ErrorCode.NOT_FOUND -> "Requested resource not found."
+                        com.example.cardsnow.wire.ErrorCode.AUTHZ -> "You are not authorized for that action."
+                        com.example.cardsnow.wire.ErrorCode.CONFLICT -> "Request conflicts with current state."
                         com.example.cardsnow.wire.ErrorCode.UNKNOWN, null -> wsMessage.message
                     }
                     showError(friendly, type)
+                    viewModelScope.launch { opAckTracker.onError(wsMessage.opId, wsMessage.message, wsMessage.code, wsMessage.type) }
                 }
                 is WireMessage.GameStateUpdate -> handleGameStateUpdate(wsMessage)
                 is WireMessage.PlayerJoined -> handlePlayerJoined(wsMessage.players)
@@ -227,6 +237,7 @@ class KtorViewModel : ViewModel() {
                         isLoadingGeneral = false
                     )
                     flushAllowed = true
+                    viewModelScope.launch { enqueuePendingOpsForReplay() }
                     flushOutgoingQueue()
                 }
                 else -> {
@@ -272,11 +283,6 @@ class KtorViewModel : ViewModel() {
             val lastDiscardedCardIds = serverState.lastDiscarded.cardIds
 
             // Basic client-side validation
-            if (deckSize < 0) {
-                Log.w(TAG, "Invalid game state: negative deck size $deckSize")
-                showError("Invalid game state received", ErrorType.CRITICAL)
-                return
-            }
             if (table.any { it.isEmpty() }) {
                 Log.w(TAG, "Invalid game state: empty pile in table")
                 showError("Invalid game state received", ErrorType.CRITICAL)
@@ -740,19 +746,18 @@ class KtorViewModel : ViewModel() {
     private fun sendMessage(message: WireMessage) {
         viewModelScope.launch {
             try {
+                val prepared = opAckTracker.ensureOpId(message)
                 val connected = wsClient.isConnected && _gameState.value.isConnected
                 if (!connected) {
                     if (outgoingQueue.size >= ClientConfig.OUTGOING_BUFFER_MAX) {
                         outgoingQueue.removeFirst()
                         if (ClientConfig.IS_DEBUG) Log.d(TAG, "Outgoing buffer full, dropping oldest message")
                     }
-                    outgoingQueue.addLast(message)
-                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Queued message: ${message::class.simpleName}")
+                    outgoingQueue.addLast(prepared)
+                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Queued message: ${prepared::class.simpleName}")
                     return@launch
                 }
-                val jsonString = json.encodeToString(WireMessage.serializer(), message)
-                if (ClientConfig.IS_DEBUG) Log.d(TAG, "Sending message: $jsonString")
-                wsClient.send(Frame.Text(jsonString))
+                sendPreparedMessage(prepared)
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending message: ${e.message}")
                 showError("Failed to send message: ${e.message}", ErrorType.TRANSIENT)
@@ -764,12 +769,10 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             while (outgoingQueue.isNotEmpty() && flushAllowed && _gameState.value.isConnected && wsClient.isConnected) {
                 val msg = outgoingQueue.removeFirst()
-                runCatching {
-                    val jsonString = json.encodeToString(WireMessage.serializer(), msg)
-                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Flushing queued message: $jsonString")
-                    wsClient.send(Frame.Text(jsonString))
-                }.onFailure {
-                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Failed to flush queued message: ${it.message}")
+                try {
+                    sendPreparedMessage(msg)
+                } catch (e: Exception) {
+                    if (ClientConfig.IS_DEBUG) Log.d(TAG, "Failed to flush queued message: ${e.message}")
                     outgoingQueue.addFirst(msg)
                     return@launch
                 }
@@ -783,14 +786,21 @@ class KtorViewModel : ViewModel() {
         if (outgoingQueue.size >= ClientConfig.OUTGOING_BUFFER_MAX) {
             outgoingQueue.removeFirst()
         }
-        outgoingQueue.addLast(message)
+        outgoingQueue.addLast(opAckTracker.ensureOpId(message))
     }
     suspend fun flushOutgoingQueueForTest() {
         while (outgoingQueue.isNotEmpty() && wsClient.isConnected) {
             val msg = outgoingQueue.removeFirst()
-            val jsonString = json.encodeToString(WireMessage.serializer(), msg)
-            wsClient.send(Frame.Text(jsonString))
+            sendPreparedMessage(msg)
         }
+    }
+
+    // Test helpers for ack/replay
+    suspend fun triggerEnqueuePendingOpsForReplayForTest() {
+        enqueuePendingOpsForReplay()
+    }
+    suspend fun ackSuccessForTest(opId: String, message: String = "OK") {
+        opAckTracker.onSuccess(opId, message)
     }
 
     suspend fun pingOnceForTest() {
@@ -800,12 +810,10 @@ class KtorViewModel : ViewModel() {
     }
 
     fun setFlushAllowedForTest(allowed: Boolean) { this.flushAllowed = allowed }
-    fun triggerFlushForTest() { flushOutgoingQueue() }
     suspend fun flushOutgoingQueueRespectingGateForTest() {
         while (outgoingQueue.isNotEmpty() && flushAllowed && wsClient.isConnected) {
             val msg = outgoingQueue.removeFirst()
-            val jsonString = json.encodeToString(WireMessage.serializer(), msg)
-            wsClient.send(Frame.Text(jsonString))
+            sendPreparedMessage(msg)
         }
     }
 
@@ -816,7 +824,47 @@ class KtorViewModel : ViewModel() {
         viewModelScope.launch {
             webSocketSession?.close()
             client.close()
+            opAckTracker.clear()
         }
+    }
+
+    private suspend fun sendPreparedMessage(message: WireMessage) {
+        val deferred = opAckTracker.onSend(message)
+        val jsonString = json.encodeToString(WireMessage.serializer(), message)
+        if (ClientConfig.IS_DEBUG) Log.d(TAG, "Sending message: $jsonString")
+        try {
+            wsClient.send(Frame.Text(jsonString))
+        } catch (e: Exception) {
+            messageOpId(message)?.let { opAckTracker.onSendFailed(it, e) }
+            deferred.cancel()
+            throw e
+        }
+    }
+
+    private suspend fun enqueuePendingOpsForReplay() {
+        val toReplay = opAckTracker.pendingForReplay()
+        if (toReplay.isEmpty()) return
+        toReplay.asReversed().forEach { outgoingQueue.addFirst(it) }
+    }
+
+    private fun messageOpId(message: WireMessage): String? = when (message) {
+        is WireMessage.JoinRoom -> message.opId
+        is WireMessage.CreateRoom -> message.opId
+        is WireMessage.StartGame -> message.opId
+        is WireMessage.PlayCards -> message.opId
+        is WireMessage.DiscardCards -> message.opId
+        is WireMessage.DrawCard -> message.opId
+        is WireMessage.DrawFromDiscard -> message.opId
+        is WireMessage.ShuffleDeck -> message.opId
+        is WireMessage.DealCards -> message.opId
+        is WireMessage.MoveCards -> message.opId
+        is WireMessage.RecallLastPile -> message.opId
+        is WireMessage.RecallLastDiscard -> message.opId
+        is WireMessage.SortHand -> message.opId
+        is WireMessage.ReorderHand -> message.opId
+        is WireMessage.RestartGame -> message.opId
+        is WireMessage.Reconnect -> message.opId
+        else -> null
     }
 
     companion object {

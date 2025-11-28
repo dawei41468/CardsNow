@@ -2,6 +2,7 @@ package com.example.cardsnow.ws
 
 import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
+import io.ktor.websocket.send
 
 interface WsClient {
     suspend fun send(frame: Frame)

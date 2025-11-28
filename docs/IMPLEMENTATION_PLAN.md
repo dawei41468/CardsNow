@@ -12,51 +12,53 @@ This plan focuses on what remains after the mitigations already implemented and 
 - Send retry + dead-letter queue on repeated failures.
 - Validation for names, room codes, card IDs, room settings.
 - Secure sessions with TTL, cleanup job, and reconnection flow.
+- Presence with 30s grace and host migration on disconnect (hybrid presence: mark offline, remove after grace if not reconnected) with tests.
+- Join hardening: `join_room` IP throttling; kept 4-digit room codes (1000–9999) by design.
+- CORS restricted in release builds via config; permissive only in dev or when explicitly allowed.
+- Frame/payload limits raised to 64KB and enforced client/server.
 - Android client: jittered exponential reconnect, Ping, bounded outgoing buffer, ack-gated flush.
 
 ---
 
-## Phase 1: Critical (ship next)
+## Phase 1: Critical (COMPLETED)
 Focus: Correctness and abuse resistance.
 
-- Presence and host-migration on disconnect
-  - Backend: On WebSocket disconnect, remove player from room, reassign host if needed, and broadcast `player_left(roomCode, playerName, newHost)`.
-  - Client: Update roster and host flag immediately on event.
-  - Acceptance: Disconnect a player → others receive `player_left`; if host leaves, `newHost` set and UI reflects change.
+- Presence and host-migration on disconnect (Hybrid with 30s grace)
+  - Backend: On WebSocket disconnect, mark player offline and broadcast presence via `GameStateUpdate`. If not reconnected within grace, remove, reassign host if needed, and broadcast `player_left(roomCode, playerName, newHost)`.
+  - Client: Roster reflects presence and host changes when events/states arrive.
+  - Acceptance: Disconnect → presence shows offline; after grace with no reconnect → `player_left` broadcast; if host leaves, `newHost` set.
 
 - Join hardening and basic security
-  - Increase room code complexity (e.g., 6-digit) and update `ValidationService`, UI input, and server constants.
-  - Add IP throttling to `join_room` similar to `create_room`.
-  - Restrict CORS in release builds (keep `anyHost()` only in dev).
-  - Acceptance: Old 4-digit codes rejected; join attempts rate-limited; release build blocks non-whitelisted origins.
-
-- Idempotency and acknowledgements
-  - Add `opId` to client requests; server maintains per-session LRU to deduplicate.
-  - Success/Error responses echo `opId`; client clears queued op upon ack.
-  - Acceptance: Replayed requests don’t duplicate effects; client UI never double-executes on reconnect.
+  - Kept room codes at 4 digits (1000–9999) per product choice.
+  - Added IP throttling to `join_room` similar to `create_room`.
+  - Restricted CORS in release builds (permitted only for allowed hosts; dev can use anyHost()).
+  - Acceptance: 4-digit codes accepted; join attempts rate-limited; release build blocks non-whitelisted origins.
 
 - Payload/frame safety
-  - Raise limits to 64KB via `ServerConfig` and env overrides; audit largest `GameState` payloads.
-  - Optional: Begin shaping incremental updates for large changes (non-blocking spike).
-  - Acceptance: Full-state updates do not exceed configured ceilings in typical 4-player scenarios.
+  - Limits raised to 64KB via `ServerConfig`; enforced on inbound payload and WS frames.
+  - Acceptance: Full-state updates fit within configured limits in typical scenarios.
 
 ---
 
-## Phase 2: High (stability and visibility)
+## Phase 2: High (stability and visibility) (COMPLETED)
 
-- Error code standardization
-  - Ensure all `sendError` paths set specific `ErrorCode` values (VALIDATION, NOT_FOUND, AUTHZ, CONFLICT, TIMEOUT, UNKNOWN).
+- [1] Error code standardization (COMPLETED)
+  - Ensure all `sendError` paths set specific `ErrorCode` values (VALIDATION, NOT_FOUND, AUTHZ, CONFLICT, TIMEOUT, INVALID_FORMAT, RATE_LIMITED, PAYLOAD_TOO_LARGE, UNKNOWN).
   - Client maps codes to friendly messages and recovery suggestions.
   - Acceptance: 100% of error responses include `code`; client-side mapping table has no fallbacks for expected errors.
 
-- Observability and health
-  - Add lightweight metrics (rooms, players, message rates, error counts, dead-letter size) and correlation IDs (room/session).
-  - Implement `/health` and `/ready` HTTP endpoints.
-  - Acceptance: Metrics exposed; dashboards show trends; health checks integrate with local runner.
+- [2] Health and readiness endpoints (COMPLETED)
+  - Add `/health` and `/ready` HTTP endpoints with lightweight checks.
+  - Acceptance: Health endpoints return 200 OK; basic readiness/health checks validated.
 
-- Lifecycle correctness
-  - Tests for join/leave, host migration, and reconnection restoring presence state.
-  - Acceptance: Automated tests cover presence and host migration flows.
+- [3] Observability metrics (COMPLETED)
+  - Expose JSON metrics at `/metrics` with: `rooms_total`, `players_total`, `ws_connections_current`, `ws_sessions_known`, `messages_total`, `messages_per_minute`, `errors_total_by_code`, `dlq_messages_total`, `dlq_rooms`.
+  - Acceptance: `/metrics` returns expected snapshot; fields validated.
+
+- [4] Idempotency and acknowledgements (COMPLETED)
+  - Add `opId` to client requests; server maintains per-session dedup LRU.
+  - Success/Error responses echo `opId`; client clears queued op upon ack.
+  - Acceptance: Replayed requests don’t duplicate effects; client UI never double-executes on reconnect.
 
 ---
 
@@ -107,9 +109,12 @@ Focus: Correctness and abuse resistance.
 - Release gating with staged rollout.
 
 ## Current status and next steps
-- Baseline protections are in place as listed above.
-- Next up: Phase 1 tasks, starting with presence/host-migration on disconnect and join hardening.
+- Phase 2 is completed (error code standardization, health/readiness endpoints, JSON metrics, idempotency/acks).
+- Next up (Phase 3 sequence):
+  1. Client connection FSM
+  2. Validation coverage tightening
+  3. Test coverage expansion
 
 ---
 
-Last Updated: 2025-11-27
+Last Updated: 2025-11-28

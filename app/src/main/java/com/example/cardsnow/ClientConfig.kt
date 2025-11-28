@@ -9,6 +9,8 @@ object ClientConfig {
     const val RECONNECT_JITTER_MAX_MS: Long = 500L
     const val PING_INTERVAL_MS: Long = 30_000L
     const val OUTGOING_BUFFER_MAX: Int = 10
+    const val OP_TIMEOUT_MS: Long = 10_000L
+    const val OP_CACHE_MAX: Int = 256
     const val ERROR_AUTO_DISMISS_MS: Long = 3_000L
     const val SUCCESS_AUTO_DISMISS_MS: Long = 2_000L
     val IS_DEBUG: Boolean by lazy {
